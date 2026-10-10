@@ -13,6 +13,8 @@ use config::{CliConfig, Config};
 use env::Environment;
 use llm::{LlmClient, Message, ToolCall};
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(name = "slop")]
@@ -93,6 +95,7 @@ async fn main() -> Result<()> {
 
     let mut last_exit_code = 0i32;
     let mut stdout_written = false; // Track if we've written anything to stdout
+    let stdout_closed = Arc::new(AtomicBool::new(false)); // Track if stdout has been closed
     let stdout = std::io::stdout();
     let mut stdout_lock = stdout.lock();
     let stderr = std::io::stderr();
@@ -157,6 +160,21 @@ async fn main() -> Result<()> {
                 eprintln!("[slop] tool call: {} ({})", tool_call.function.name, tool_call.function.arguments);
             }
 
+            // Parse args early to check for terminal conditions
+            let args: serde_json::Value = serde_json::from_str(&tool_call.function.arguments).unwrap_or_default();
+
+            // Check if this is a terminal tool call (before execution)
+            let is_terminal = match tool_call.function.name.as_str() {
+                "run_command" => {
+                    let stdout_dest = args.get("stdout_dest").and_then(|v| v.as_str()).unwrap_or("passthrough");
+                    stdout_dest == "passthrough"
+                }
+                "write_to_stdout" => {
+                    args.get("close").and_then(|v| v.as_bool()).unwrap_or(false)
+                }
+                _ => false,
+            };
+
             let result = execute_tool(
                 tool_call,
                 &mut runner,
@@ -164,6 +182,7 @@ async fn main() -> Result<()> {
                 &config,
                 &mut stdout_lock,
                 &mut stderr_lock,
+                &stdout_closed,
             ).await;
 
             let result_json = match &result {
@@ -175,24 +194,32 @@ async fn main() -> Result<()> {
                 eprintln!("[slop] tool result: {}", result_json);
             }
 
-            // Track exit code and stdout writes from run_command
+            // Track exit code from run_command
             if tool_call.function.name == "run_command" {
                 if let Ok(r) = &result {
                     if let Some(exit_code) = r.get("exit_code").and_then(|v| v.as_i64()) {
                         last_exit_code = exit_code as i32;
                     }
-                    // Check if this was a passthrough (stdout was written)
-                    let args: serde_json::Value = serde_json::from_str(&tool_call.function.arguments).unwrap_or_default();
-                    let stdout_dest = args.get("stdout_dest").and_then(|v| v.as_str()).unwrap_or("passthrough");
-                    if stdout_dest == "passthrough" {
-                        stdout_written = true;
-                    }
                 }
             }
 
-            // Track stdout writes from write_to_stdout
+            // Track stdout writes
             if tool_call.function.name == "write_to_stdout" && result.is_ok() {
                 stdout_written = true;
+            }
+            if tool_call.function.name == "run_command" {
+                let stdout_dest = args.get("stdout_dest").and_then(|v| v.as_str()).unwrap_or("passthrough");
+                if stdout_dest == "passthrough" && result.is_ok() {
+                    stdout_written = true;
+                }
+            }
+
+            // Terminal tool call: exit immediately, don't continue conversation
+            if is_terminal && result.is_ok() {
+                if config.verbose {
+                    eprintln!("[slop] terminal tool call ({}), exiting with code {}", tool_call.function.name, last_exit_code);
+                }
+                std::process::exit(last_exit_code);
             }
 
             messages.push(Message {
@@ -216,6 +243,7 @@ async fn execute_tool(
     config: &Config,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
+    stdout_closed: &Arc<AtomicBool>,
 ) -> Result<serde_json::Value> {
     let args: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
         .context("Failed to parse tool arguments")?;
@@ -243,15 +271,28 @@ async fn execute_tool(
                 .and_then(|v| v.as_str())
                 .context("Missing 'command' parameter")?;
 
-            let stdin_source: StdinSource = args.get("stdin_source")
+            let mut stdin_source: StdinSource = args.get("stdin_source")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or_default();
+
+            // Guard: don't forward TTY stdin to child — would block forever
+            if stdin_source == StdinSource::Inherit && !env.stdin_type.is_readable() {
+                if config.verbose {
+                    eprintln!("[slop] stdin is {:?}, overriding stdin_source from 'inherit' to 'none'", env.stdin_type);
+                }
+                stdin_source = StdinSource::None;
+            }
 
             let stdin_text = args.get("stdin_text").and_then(|v| v.as_str());
 
             let stdout_dest: StdoutDest = args.get("stdout_dest")
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or_default();
+
+            // Warn if trying to passthrough to a closed stdout
+            if stdout_dest == StdoutDest::Passthrough && stdout_closed.load(Ordering::SeqCst) {
+                anyhow::bail!("Cannot use stdout_dest='passthrough': stdout has been closed by a previous write_to_stdout(close=true) call");
+            }
 
             let capture_limit_override = args.get("capture_limit")
                 .and_then(|v| v.as_u64())
@@ -276,8 +317,34 @@ async fn execute_tool(
             let text = args.get("text")
                 .and_then(|v| v.as_str())
                 .context("Missing 'text' parameter")?;
+            let close = args.get("close")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            if stdout_closed.load(Ordering::SeqCst) {
+                anyhow::bail!("stdout is already closed");
+            }
+
             stdout.write_all(text.as_bytes())?;
             stdout.flush()?;
+
+            if close {
+                // Flush and close fd 1 at the OS level — sends EOF downstream
+                stdout.flush()?;
+                #[cfg(unix)]
+                unsafe {
+                    libc::close(libc::STDOUT_FILENO);
+                }
+                stdout_closed.store(true, Ordering::SeqCst);
+                if config.verbose {
+                    eprintln!("[slop] stdout closed by LLM");
+                }
+                return Ok(serde_json::json!({
+                    "bytes_written": text.len(),
+                    "closed": true
+                }));
+            }
+
             Ok(serde_json::json!({ "bytes_written": text.len() }))
         }
 

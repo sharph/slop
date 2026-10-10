@@ -202,10 +202,13 @@ immediate EOF.
 
 ### write_to_stdout
 Write text to slop's stdout. Can be called multiple times; text is appended in order.
-Use this to produce your final output.
+Use this to produce your final output. Set close=true on the final call to close the
+stream (sends EOF to downstream commands).
 
 Parameters:
 - text (string, required): The text to write.
+- close (boolean, optional): If true, close stdout after writing. Sends EOF to any
+  downstream command in a pipeline. Use on the final write_to_stdout call. Default: false.
 
 ### write_to_stderr
 Write text to slop's stderr. This is visible to the user but does NOT pollute
@@ -261,6 +264,17 @@ Parameters:
 or `run_command` with `passthrough`), the LLM's final text response goes to **stderr**
 (commentary), not stdout. This prevents the LLM from duplicating output or polluting
 the data stream with explanations.
+
+**Terminal tool calls**: `run_command` with `stdout_dest="passthrough"` and
+`write_to_stdout(close=true)` are **terminal** — slop exits immediately after the
+tool completes, with the exit code of the command (or 0 for `write_to_stdout`).
+The conversation does not continue. This ensures the command's output IS the final
+output, with no risk of the LLM adding more data afterward.
+
+**Closing stdout**: The LLM can close stdout early via `write_to_stdout(close=true)`.
+This flushes and closes fd 1 at the OS level, sending EOF to downstream commands
+immediately — useful in pipelines where the downstream command should not wait for
+slop to exit. After closing, no more writes to stdout are possible.
 
 **Content format compatibility**: The `content` field in LLM responses can be either
 a plain string (OpenAI) or an array of content parts (Mistral, etc.). Only `"text"`
@@ -401,20 +415,24 @@ type parts are extracted; other types (e.g., `"thinking"`) are ignored.
 
 ### 6.3 `write_to_stdout`
 
-**Purpose**: Write text to slop's stdout.
+**Purpose**: Write text to slop's stdout. Can optionally close the stream.
 
 **Schema**:
 
 ```json
 {
   "name": "write_to_stdout",
-  "description": "Write text to slop's stdout. Can be called multiple times; text is appended in order.",
+  "description": "Write text to slop's stdout. Can be called multiple times; text is appended in order. Set close=true on the final call to close the stream (sends EOF to downstream commands).",
   "parameters": {
     "type": "object",
     "properties": {
       "text": {
         "type": "string",
         "description": "Text to write to stdout"
+      },
+      "close": {
+        "type": "boolean",
+        "description": "If true, close stdout after writing. Sends EOF to downstream. Use on the final write_to_stdout call. Default: false."
       }
     },
     "required": ["text"]
@@ -424,13 +442,21 @@ type parts are extracted; other types (e.g., `"thinking"`) are ignored.
 
 **Behavior**: Write text to stdout immediately. Flush after each call.
 
+If `close=true`:
+1. Write the text and flush
+2. Close fd 1 at the OS level (`libc::close(STDOUT_FILENO)`) — sends EOF downstream
+3. Mark stdout as closed — subsequent `write_to_stdout` calls and `run_command` with `stdout_dest="passthrough"` return an error
+
 **Return**:
 
 ```json
 {
-  "bytes_written": 42
+  "bytes_written": 42,
+  "closed": true
 }
 ```
+
+(`closed` is only present when `close=true` was passed.)
 
 ---
 
@@ -567,12 +593,16 @@ exit(1)
 | LLM API error (network, auth, rate limit) | Print error to stderr, exit 1 |
 | LLM returns malformed response | Print error to stderr, exit 1 |
 | `run_command` fails to spawn | Return error in tool result, LLM can retry |
-| `run_command` exits non-zero | Return exit code in tool result. LLM decides what to do. Final slop exit code = last command's exit code. |
+| `run_command` exits non-zero | Return exit code in tool result. For `passthrough`, slop exits immediately with this code. For `capture`/`discard`, LLM decides what to do. |
+| `run_command` with `passthrough` completes | **TERMINAL**: slop exits immediately with the command's exit code |
+| `write_to_stdout(close=true)` completes | **TERMINAL**: slop exits immediately with code 0 |
 | Max iterations exceeded | Error to stderr, exit 1 |
 | Missing config (no model/api_key) | Error to stderr with helpful message, exit 1 |
 | Broken pipe (downstream command exits early) | Exit gracefully with SIGPIPE behavior (exit code 141 or 0) |
 | Capture limit exceeded | Truncate, set `stdout_truncated: true` in result |
 | LLM requests capture limit above max | Clamp to configured maximum |
+| Write to stdout after `close=true` | Return error: "stdout is already closed" |
+| `run_command` with `passthrough` after `close=true` | Return error: stdout is closed |
 
 ---
 

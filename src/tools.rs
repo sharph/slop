@@ -47,7 +47,7 @@ pub fn tool_definitions() -> Vec<Value> {
                         "stdout_dest": {
                             "type": "string",
                             "enum": ["passthrough", "capture", "discard"],
-                            "description": "Where the command's stdout goes. 'passthrough' (default) = directly to slop's stdout (use for large streams). 'capture' = returned to you (use to analyze output). 'discard' = /dev/null."
+                            "description": "Where the command's stdout goes. 'passthrough' (default) = directly to slop's stdout (use for large streams). TERMINAL: slop exits immediately after this command finishes. 'capture' = returned to you (use to analyze output). 'discard' = /dev/null."
                         },
                         "capture_limit": {
                             "type": "integer",
@@ -66,13 +66,17 @@ pub fn tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "write_to_stdout",
-                "description": "Write text to slop's stdout. Can be called multiple times; text is appended in order. Use this to produce your final output.",
+                "description": "Write text to slop's stdout. Can be called multiple times; text is appended in order. Use this to produce your final output. Set close=true on the final call to close the stream — TERMINAL: slop exits immediately (sends EOF to downstream commands).",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "text": {
                             "type": "string",
                             "description": "Text to write to stdout"
+                        },
+                        "close": {
+                            "type": "boolean",
+                            "description": "If true, close stdout after writing. This sends EOF to any downstream command in a pipeline. Use this on your final write_to_stdout call. Default: false."
                         }
                     },
                     "required": ["text"]

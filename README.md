@@ -87,7 +87,7 @@ Precedence: **CLI flag > env var > config file > default**
 |------|---------|
 | `peek_input` | Read the head of stdin (buffered, replayed to commands — doesn't lose data) |
 | `run_command` | Execute a shell command with configurable stdin source and stdout destination |
-| `write_to_stdout` | Write text to stdout (the LLM's own output) |
+| `write_to_stdout` | Write text to stdout. Optional `close=true` parameter closes the stream (sends EOF to downstream commands) |
 | `write_to_stderr` | Write text to stderr (commentary, doesn't pollute the pipe) |
 
 ### `run_command` options

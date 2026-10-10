@@ -49,6 +49,9 @@ Parameters:
 - stdout_dest (string, optional): Where the command's stdout goes.
     "passthrough" (default): Directly to slop's stdout. Use this for large streams
       that should flow through without loading into your context.
+      **TERMINAL**: slop exits immediately after this command finishes. The
+      command's output IS the final output. Do NOT plan any further tool calls
+      after a passthrough command.
     "capture": Captured and returned to you. Use this when you need to analyze
       the output before deciding what to do.
     "discard": /dev/null.
@@ -71,6 +74,14 @@ immediate EOF.
 ### write_to_stdout
 Write text to slop's stdout. Can be called multiple times; text is appended in order.
 Use this to produce your final output.
+
+Parameters:
+- text (string, required): The text to write.
+- close (boolean, optional): If true, close stdout after writing. This sends EOF
+  to any downstream command in a pipeline. Use this on your FINAL write_to_stdout
+  call to signal that you are done. Default: false.
+  WARNING: After closing, no more writes to stdout are possible. Do not close
+  stdout if you still need to run commands with stdout_dest="passthrough".
 
 ### write_to_stderr
 Write text to slop's stderr. This is visible to the user but does NOT pollute
@@ -108,8 +119,17 @@ Example 3 — "what are the top pages?" (stdin=pipe, stdout=terminal):
   → Or just respond with text summary (approach A)
 
 **After run_command with stdout_dest="passthrough":**
-The command's output is already on stdout. Respond with empty text (content="")
-to finish. Do NOT call write_to_stdout. Do NOT add commentary.
+**slop exits immediately after the command finishes.** The command's output IS
+the final output. There is no "after" — do not plan any further actions.
+This is TERMINAL — slop will not make any more API calls.
+
+**Signaling completion with write_to_stdout(close=true):**
+When you produce your final output via write_to_stdout, set close=true on the
+last call. This closes the stream and sends EOF to downstream commands immediately,
+without waiting for slop to exit. Use this when stdout is a pipe and you are done.
+
+**IMPORTANT**: write_to_stdout(close=true) is TERMINAL — slop exits immediately
+after closing stdout. There is no "after" — do not plan any further actions.
 
 When stdout is a PIPE (connected to another command):
 - Output ONLY the raw data. No commentary, no explanations, no "Done!" messages.

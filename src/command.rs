@@ -192,10 +192,17 @@ impl CommandRunner {
             None
         };
 
-        // Capture stderr
-        let stderr = if let Some(child_stderr) = child.stderr.take() {
+        // Capture stderr (with drain to prevent child from blocking on full pipe)
+        let stderr = if let Some(mut child_stderr) = child.stderr.take() {
             let mut buf = Vec::new();
-            let _ = child_stderr.take(stderr_limit as u64).read_to_end(&mut buf).await;
+            // Read up to stderr_limit bytes
+            {
+                let mut limited = (&mut child_stderr).take(stderr_limit as u64);
+                let _ = limited.read_to_end(&mut buf).await;
+            }
+            // Drain remaining stderr so child doesn't block on a full pipe
+            let mut drain = Vec::new();
+            let _ = child_stderr.read_to_end(&mut drain).await;
             let text = String::from_utf8_lossy(&buf).into_owned();
             if text.is_empty() { None } else { Some(text) }
         } else {
